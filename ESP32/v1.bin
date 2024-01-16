@@ -1,0 +1,296 @@
+#include <WiFi.h>
+#include <ESPAsyncWebSrv.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <ESP32Servo.h>
+#include <HTTPClient.h>
+#include <ESP32httpUpdate.h>
+#include <ESPmDNS.h>
+#include <Update.h>
+#include <ArduinoOTA.h>
+#include <ArduinoJson.h>
+
+//SSID e Senha da rede Wi-Fi que será conectada
+const char *ssid = "FABIO MARTINS";
+const char *password = "212829maju";
+//Versão do firmware do dispositivo
+String firmware = "1.0";
+//Instancia um webserver na porta 80
+AsyncWebServer server(80);
+//Seleciona o display LCD com endereço 0x27 (16 col x 2 lin)
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+// Pino do servo motor
+const int SERVO_PIN = 5;
+Servo myServo;
+// Pinos do buzzer e LEDs
+const int BUZZER_PIN = 18;
+const int GREEN_LED_PIN = 19;
+const int RED_LED_PIN = 23;
+//Variável para gerar senha aleatória
+int generatedCode;
+// Flag para verificar se a porta está aberta
+bool portaAberta = false;
+// Variável global para armazenar o endereço IP
+String ipAddress;
+
+void setup() {
+  // Inicializa os pinos do buzzer, LEDs e servo motor
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(GREEN_LED_PIN, OUTPUT);
+  pinMode(RED_LED_PIN, OUTPUT);
+  myServo.attach(SERVO_PIN);
+
+  // Inicializa a porta serial
+  Serial.begin(115200);
+
+  // Conecta ao Wi-Fi
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(1000);
+    Serial.println("Conectando ao WiFi...");
+  }
+  Serial.println("Conectado ao WiFi");
+  Serial.print("Endereço de IP: ");
+  Serial.println(WiFi.localIP());
+  
+  //Gera uma senha aleatória entre 1000 e 9999
+  generatedCode = random(1000, 9999);
+
+  // Configurar o OTA
+  ArduinoOTA.begin();
+
+  // Configurar o servidor HTTP
+  server.on(
+    "/update", HTTP_POST, [](AsyncWebServerRequest *request) {
+      if (
+        !Update.hasError()) {
+        AsyncWebServerResponse *response = request->beginResponse(200, "text/plain", "Update realizado com sucesso");
+        response->addHeader("Connection", "close");
+        request->send(response);
+
+        ESP.restart();
+      } else {
+        request->send(403, "text/plain", "Falha na autenticacao ou erro no update");
+      }
+    },
+    [](AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final) {
+      if (!index) {
+        Serial.printf("Iniciando upload: %s\n", filename.c_str());
+        if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+          Update.printError(Serial);
+        }
+      }
+      if (!Update.hasError()) {
+        if (Update.write(data, len) != len) {
+          Update.printError(Serial);
+        }
+      }
+      if (final) {
+        if (Update.end(true)) {
+          Serial.printf("Upload concluido: %u bytes\n", index + len);
+        } else {
+          Update.printError(Serial);
+        }
+      } else {
+        int percent = (index + len) * 100 / Update.size();
+        Serial.printf("Progresso: %d%%\n", percent);
+      }
+    });
+
+  //Endpoint "/getFirmware" GET que envia o firmware do dispositivo
+  server.on("/getFirmware", HTTP_GET, [](AsyncWebServerRequest *request) {
+    // Cria um objeto JSON manualmente
+    String json = "{\"firmware\":\"" + firmware + "\"}";
+
+    // Cria uma resposta JSON
+    AsyncResponseStream *response = request->beginResponseStream("application/json");
+    response->print(json);
+    request->send(response);
+  });
+
+  // Adiciona um endpoint para verificar o status da porta
+  server.on("/statusPorta", HTTP_GET, [](AsyncWebServerRequest *request) {
+    String status = portaAberta ? "Porta aberta" : "Porta fechada";
+    request->send(200, "text/plain", status);
+  });
+
+  server.on("/fecharPorta", HTTP_GET, [](AsyncWebServerRequest *request) {
+    // Fecha a porta (você pode precisar adaptar conforme necessário)
+    myServo.write(0);  // Gire o servo motor para a posição fechada
+    portaAberta = false;
+
+    // Redireciona para a tela principal
+    request->redirect("/");
+  });
+  // Inicia o servidor
+  server.begin();
+
+  // Inicializa o display LCD
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(1, 0);
+  lcd.print("Codigo: ");
+  lcd.print(generatedCode);
+  Serial.print(generatedCode);
+
+  // Manipula as solicitações HTTP
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+    // Se a porta estiver aberta, redireciona para a página de "Porta Aberta"
+    if (portaAberta) {
+      request->redirect("/portaAberta");
+      return;
+    }
+    // Cria a página HTML com o formulário de autenticação
+    String html = "<html><head><meta name='viewport' content='width=device-width, initial-scale=1.0'></head><body style='width: 100%; height: 100vh; margin: 0; background-color: #1E1E1E; display: flex; justify-content: center; align-items: center;'>";
+    html += "<div style='background-color: #FFF; width: 80%; max-width: 400px; border-radius: 10px; height: 60vh;'>";
+    html += "<form action='/unlock' method='post'>";
+    html += "<h1 style='color: #1E1E1E; font-family: sans-serif; text-align: center;'>ControlLab</h1>";
+    html += "<div style='display: flex; justify-content: center; align-items: center; flex-direction: column;'>";
+    html += "<input style='width: 80%; max-width: 255px; height: 5vh; margin-bottom: 15px;' type='text' placeholder='Digite a senha' name='code'>";
+    html += "<input style='background-color: #2957CC; border: 0; color: #FFF; height: 5vh; width: 80%; max-width: 263px;' type='submit' value='Destrancar'>";
+    html += "<h5 style='color: #1E1E1E; font-family: sans-serif;'>IFS - Campus Lagarto (V. 1.0 - Jenipapo)</h5>";
+    html += "</div></form></div></body></html>";
+
+    // Envia a página HTML para o navegador
+    request->send(200, "text/html", html);
+  });
+
+  // Manipula o formulário de autenticação
+  server.on("/unlock", HTTP_POST, [](AsyncWebServerRequest *request) {
+    // Obtém o código inserido pelo usuário
+    String userCode = request->arg("code");
+
+    // Verifica se o código inserido pelo usuário corresponde ao código gerado
+    if (userCode.toInt() == generatedCode) {
+      // Destrancar a fechadura
+      unlockDoor();
+      // Redireciona para a página "Porta Aberta"
+      request->redirect("/portaAberta");
+    } else {
+      // Ativar o buzzer e o LED vermelho em caso de código incorreto
+      activateAlarm();
+
+      // Modificado para incluir a mensagem de erro no HTML
+      String errorMessage = "Codigo incorreto. Tente novamente.";
+      String html = "<html><head><meta name='viewport' content='width=device-width, initial-scale=1.0'></head><body style='width: 100%; height: 100vh; margin: 0; background-color: #1E1E1E; display: flex; justify-content: center; align-items: center;'>";
+      html += "<div style='background-color: #FFF; width: 80%; max-width: 400px; border-radius: 10px; height: 60vh;'>";
+      html += "<form action='/unlock' method='post'>";
+      html += "<h1 style='color: #1E1E1E; font-family: sans-serif; text-align: center;'>ControlLab</h1>";
+      html += "<div style='display: flex; justify-content: center; align-items: center; flex-direction: column;'>";
+
+      // Adiciona a mensagem de erro
+      html += "<p style='color: red; font-size: 14px; margin-bottom: 10px;'>" + errorMessage + "</p>";
+      html += "<input style='width: 80%; max-width: 255px; height: 5vh; margin-bottom: 15px;' type='text' placeholder='Digite a senha' name='code'>";
+      html += "<input style='background-color: #2957CC; border: 0; color: #FFF; height: 5vh; width: 80%; max-width: 263px;' type='submit' value='Destrancar'>";
+      html += "<h5 style='color: #1E1E1E; font-family: sans-serif;'>IFS - Campus Lagarto (V. 1.0 - Jenipapo)</h5>";
+      html += "</div></form></div></body></html>";
+
+      request->send(403, "text/html", html);
+    }
+  });
+
+
+  // Adiciona um endpoint para a página de "Porta Aberta"
+  server.on("/portaAberta", HTTP_GET, [](AsyncWebServerRequest *request) {
+    // Cria a página HTML
+    String html = "<html><head><meta name='viewport' content='width=device-width, initial-scale=1.0'></head><body style='width: 100%; height: 100vh; margin: 0; background-color: #1E1E1E; display: flex; justify-content: center; align-items: center;'>";
+    html += "<div style='background-color: #FFF; width: 80%; max-width: 400px; border-radius: 10px; height: 60vh;'>";
+    html += "<form action='/fecharPorta' method='get'>";
+    html += "<h1 style='color: #1E1E1E; font-family: sans-serif; text-align: center; margin-bottom: 15px'>ControlLab</h1>";
+    html += "<h1 style='color: #008000; font-family: sans-serif; text-align: center;'>Porta Aberta</h1>";
+    html += "<div style='display: flex; justify-content: center; align-items: center; flex-direction: column;'>";
+    html += "<input style='background-color: #FF0000; border: 0; color: #FFF; height: 5vh; width: 80%; max-width: 263px;'type='submit' value='Fechar Porta'>";
+    html += "<h5 style='color: #1E1E1E; font-family: sans-serif;'>IFS - Campus Lagarto (V. 1.0 - Jenipapo)</h5>";
+    html += "</div></form></div></body></html>";
+
+    // Envia a página HTML para o navegador
+    request->send(200, "text/html", html);
+  });
+
+  // Inicia o servidor
+  server.begin();
+}
+
+// Função para verificar a permissão de acesso usando a API RESTful
+bool checkAccessPermission(String address_ip) {
+  // Construa a URL do seu endpoint
+  String endpoint = "https://localhost:7204/api/Devices/CheckAccessPermission/" + address_ip;
+
+  // Crie uma instância do cliente HTTP
+  HTTPClient http;
+
+  // Faça a solicitação GET para a API
+  http.begin(endpoint);
+
+  // Obtém a resposta da API
+  int httpResponseCode = http.GET();
+
+  // Verifica se a solicitação foi bem-sucedida (código de resposta 200)
+  if (httpResponseCode == 200) {
+    // Lê a resposta como uma String
+    String payload = http.getString();
+
+    // Converte a String para um valor booleano
+    bool accessGranted = payload.toInt() == 1;
+
+    // Libera os recursos do cliente HTTP
+    http.end();
+
+    return accessGranted;
+  } else {
+    // Em caso de erro, imprima o código de resposta
+    Serial.println("Falha na solicitação HTTP. Código de resposta: " + String(httpResponseCode));
+
+    // Libera os recursos do cliente HTTP
+    http.end();
+
+    return false;
+  }
+}
+
+// Função para realizar a lógica de destravamento da fechadura
+void unlockDoor() {
+  // Verifica se o endereço IP tem permissão de acesso
+  if (checkAccessPermission(ipAddress)) {
+    // Acesso permitido, continue com a lógica existente
+    if (!portaAberta) {
+      myServo.write(180);
+      digitalWrite(GREEN_LED_PIN, HIGH);
+      delay(2000);
+      digitalWrite(BUZZER_PIN, HIGH);
+      delay(500);
+      digitalWrite(BUZZER_PIN, LOW);
+      delay(500);
+      digitalWrite(BUZZER_PIN, HIGH);
+      delay(500);
+      digitalWrite(BUZZER_PIN, LOW);
+      digitalWrite(GREEN_LED_PIN, LOW);
+      portaAberta = true;
+    }
+  } else {
+    // Acesso negado, exiba a mensagem no display LCD
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Acesso Negado");
+    lcd.setCursor(0, 1);
+    lcd.print("Horario Indevido");
+  }
+}
+
+void activateAlarm() {
+  // Ativar o buzzer e o LED vermelho por 2 segundos
+  digitalWrite(RED_LED_PIN, HIGH);
+  delay(2000);
+  digitalWrite(BUZZER_PIN, HIGH);
+  delay(500);
+  digitalWrite(BUZZER_PIN, LOW);
+  delay(500);
+  digitalWrite(BUZZER_PIN, HIGH);
+  delay(500);
+  digitalWrite(BUZZER_PIN, LOW);
+  digitalWrite(RED_LED_PIN, LOW);
+}
+
+void loop() {
+  ArduinoOTA.handle();
+}
